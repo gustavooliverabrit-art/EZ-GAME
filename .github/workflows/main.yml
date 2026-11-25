@@ -1,4 +1,4 @@
-name: RDP
+name: RDP-AnyDesk-7-Days-Max-Power
 
 on:
   workflow_dispatch:
@@ -7,48 +7,127 @@ permissions:
   contents: read
 
 jobs:
-  pc-virtual:
-    runs-on: windows-latest
-    timeout-minutes: 10080 # 7 dias * 24 horas * 60 minutos
+  anydesk-rdp:
+    runs-on: windows-4-core # Máxima potência disponível (8 vCPU, 16GB RAM)
+    timeout-minutes: 10080   # 7 dias exatos (7 * 24 * 60 = 10080 minutos)
 
     steps:
-      - name: Instalar AnyDesk e mostrar ID e senha
-        timeout-minutes: 15
+      - name: Instalar AnyDesk e Configurar
+        id: install
         run: |
+          Write-Host "Iniciando instalação do AnyDesk..."
+          
+          # Gerar senha segura
           $chars = "abcdefghjkmnpqrstuvwxyz23456789".ToCharArray()
           $pw = "Ab3-" + (-join ($chars | Get-Random -Count 10))
-
-          $ad = "C:\AnyDesk\AnyDesk.exe"
-          Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile "$env:TEMP\AnyDesk.exe"
-          Start-Process "$env:TEMP\AnyDesk.exe" -ArgumentList "--install C:\AnyDesk --start-with-win --silent"
-
-          for ($i = 0; $i -lt 40 -and -not (Test-Path $ad); $i++) { Start-Sleep -Seconds 3 }
-          if (-not (Test-Path $ad)) {
-              Write-Error "AnyDesk nao foi instalado"
+          
+          $installDir = "C:\AnyDesk"
+          $exePath = "$installDir\AnyDesk.exe"
+          $passFile = "$env:TEMP\.ad_pass"
+          
+          # Baixar AnyDesk
+          $tempExe = "$env:TEMP\AnyDesk.exe"
+          Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile $tempExe
+          
+          # Instalar silenciosamente
+          Start-Process $tempExe -ArgumentList "--install $installDir --start-with-win --silent" -Wait
+          
+          # Aguardar instalação
+          $retryCount = 0
+          while (-not (Test-Path $exePath) -and $retryCount -lt 30) {
+              Start-Sleep -Seconds 2
+              $retryCount++
+          }
+          
+          if (-not (Test-Path $exePath)) {
+              Write-Error "Falha na instalação do AnyDesk"
               exit 1
           }
-          Start-Sleep -Seconds 15
-
-          cmd /c "echo $pw | ""$ad"" --set-password"
-          Start-Sleep -Seconds 5
-
+          
+          # Definir senha via arquivo (método mais confiável)
+          Set-Content -Path $passFile -Value $pw -NoNewline
+          & $exePath --set-password < $passFile
+          Start-Sleep -Seconds 2
+          
+          # Obter ID
           $id = ""
-          for ($i = 0; $i -lt 12 -and -not $id; $i++) {
-              $id = (& $ad --get-id | Out-String).Trim()
+          $retryId = 0
+          while (-not $id -and $retryId -lt 15) {
+              try {
+                  $id = (& $exePath --get-id).Trim()
+              } catch {
+                  Write-Warning "Erro ao obter ID: $_"
+              }
               if (-not $id) { Start-Sleep -Seconds 5 }
+              $retryId++
           }
+          
           if (-not $id) {
-              Write-Error "Nao consegui obter o ID do AnyDesk"
+              Write-Error "Não foi possível obter o ID do AnyDesk"
               exit 1
           }
-
-          Write-Host ""
+          
+          # Salvar variáveis para uso no próximo step
+          echo "ID=$id" >> $env:GITHUB_OUTPUT
+          echo "SENHA=$pw" >> $env:GITHUB_OUTPUT
+          
           Write-Host "=============================="
           Write-Host "ID:    $id"
           Write-Host "SENHA: $pw"
           Write-Host "=============================="
 
-      - name: Manter ativo por 7 dias
+      - name: Manter AnyDesk Ativo (Loop Infinito Controlado)
         run: |
-          $end = (Get-Date).AddDays(7)
-          while ((Get-Date) -lt $end) { Start-Sleep -Seconds 60 }
+          Write-Host "Iniciando loop de manutenção..."
+          
+          $anydeskPath = "C:\AnyDesk\AnyDesk.exe"
+          $logFile = "C:\anydesk_keepalive.log"
+          
+          function Log-Message {
+              param($Message)
+              $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              "$timestamp - $Message" | Out-File -FilePath $logFile -Append
+              Write-Host $Message
+          }
+          
+          # Função de monitoramento em segundo plano
+          $scriptBlock = {
+              param($exePath, $logFile)
+              
+              while ($true) {
+                  try {
+                      # Verificar se o serviço AnyDesk está rodando
+                      $service = Get-Service -Name "AnyDesk" -ErrorAction SilentlyContinue
+                      
+                      if ($service.Status -ne "Running") {
+                          Log-Message "Serviço AnyDesk não está rodando. Tentando iniciar..."
+                          Start-Process $exePath -WindowStyle Minimized -ErrorAction SilentlyContinue
+                          Start-Sleep -Seconds 10
+                      } else {
+                          # Escrever log periódico para manter o job ativo
+                          Log-Message "AnyDesk está rodando. Status: $($service.Status)"
+                      }
+                      
+                      # Dormir por 30 segundos antes da próxima verificação
+                      Start-Sleep -Seconds 30
+                      
+                  } catch {
+                      Log-Message "Erro na verificação: $_"
+                      Start-Sleep -Seconds 5
+                  }
+              }
+          }
+          
+          # Iniciar o job de monitoramento
+          $job = Start-Job -ScriptBlock $scriptBlock -ArgumentList $anydeskPath, $logFile
+          
+          # Manter o script principal vivo enquanto o job roda
+          # Isso evita que o GitHub Actions encerre o job principal antes do timeout
+          while ((Get-Job -Id $job.Id).State -eq "Running") {
+              Start-Sleep -Seconds 60
+              # Forçar escrita de log para garantir que o job não seja considerado ocioso
+              Add-Content -Path $logFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Job ativo: $(Get-Job -Id $job.Id).State"
+          }
+          
+          Stop-Job -Id $job.Id
+          Remove-Job -Id $job.Id
